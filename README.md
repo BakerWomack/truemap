@@ -54,10 +54,19 @@ cargo test                                          # 68 unit tests, no network 
 | | |
 |---|---|
 | **OS** | **Linux only.** `src/sweep.rs` uses the Linux value of `RLIMIT_NOFILE`, and `--l4` needs `AF_INET`/`SOCK_RAW` plus file capabilities. `install.sh` refuses to build elsewhere rather than produce a binary that misreads its own fd limit. |
-| **Rust** | Edition 2021, stable toolchain. Installed by `install.sh` via [rustup](https://rustup.rs) if absent. |
+| **Rust** | Edition 2021, stable toolchain. Installed by `install.sh` via [rustup](https://rustup.rs) if absent — that fetch passes `curl -k`, so it does **not** verify the TLS certificate; see the note below. |
 | **C linker** | `cc` — every dependency is pure Rust, but `rustc` shells out to link. |
 | **Optional** | `libcap2-bin` (for `setcap`), to enable `--l4`. Everything else works without it. |
 | **nmap** | Optional, only for the `-- <nmap args>` hand-off. |
+
+> **The rustup bootstrap does not verify TLS.** `install.sh` fetches
+> <https://sh.rustup.rs> with `curl -k` and pipes it into `sh`, so the installer will run
+> whatever that connection returns. This is deliberate — it keeps the bootstrap working
+> where the chain cannot be validated locally — but it means an on-path attacker can
+> substitute the script. If that matters to you, install Rust yourself from
+> [rustup.rs](https://rustup.rs) and re-run `install.sh`, which then skips the fetch
+> entirely; or drop `-k` from the `curl` line; or, behind a known intercepting proxy, swap
+> it for `--cacert <its-ca.pem>`.
 
 > **`setcap` is per-inode, so `cargo build` drops it.** The installer grants the
 > capability to the *installed* binary, which a rebuild leaves alone. If you run

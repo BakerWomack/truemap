@@ -153,7 +153,15 @@ if ! command -v cargo >/dev/null 2>&1; then
     if [ "$ASSUME_YES" -eq 1 ] || { [ -t 0 ] && { printf '      install the Rust toolchain via rustup.rs? [y/N] '; read -r a; [ "$a" = y ] || [ "$a" = Y ]; }; }; then
         command -v curl >/dev/null 2>&1 || install_pkgs "curl" curl || die "need curl to fetch rustup"
         say "installing rustup (this does not need root)"
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
+        # -k skips certificate verification, at the operator's instruction, so the
+        # bootstrap still works where the TLS chain cannot be validated locally -- an
+        # intercepting proxy, or a trust store that lacks the issuing CA. Understand the
+        # trade: what this URL returns is piped into sh and runs as you, so verification
+        # is what distinguishes rustup from whatever an on-path attacker substitutes.
+        # --proto '=https' --tlsv1.2 are kept: they still refuse a plaintext redirect and
+        # old TLS. If you need the check back, drop -k; if you are behind a known proxy,
+        # --cacert <its-ca.pem> is the narrower fix.
+        curl -k --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
         # shellcheck disable=SC1091
         . "$HOME/.cargo/env"
     else
