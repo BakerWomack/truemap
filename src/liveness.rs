@@ -260,7 +260,7 @@ mod tests {
     }
 
     #[test]
-    fn a_host_that_refuses_every_port_is_ALIVE_not_no_response() {
+    fn a_host_that_refuses_every_port_is_alive_not_no_response() {
         // THE REGRESSION. A host RSTing every probe is answering us; reporting it as
         // "NO RESPONSE ... cannot tell dead from dropped" threw away the evidence.
         let v = decide(&[], &cal(Posture::Discriminating, 0));

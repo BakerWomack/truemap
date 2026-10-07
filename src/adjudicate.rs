@@ -377,7 +377,7 @@ mod tests {
     }
 
     #[test]
-    fn a_silent_port_on_a_discriminating_host_is_NOT_called_fake() {
+    fn a_silent_port_on_a_discriminating_host_is_not_called_fake() {
         // The anti-false-negative guard. No calibration baseline exists because
         // closed ports refused, so there is nothing to match against.
         let c = calib(Posture::Discriminating, vec![]);
