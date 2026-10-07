@@ -29,7 +29,9 @@ use crate::probe::ProbeCfg;
 
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
+    // nmap's `-iL` and `-p-` are rewritten into flags clap can express before it
+    // ever sees them; see cli::rewrite_nmap_flags for why they cannot be declared.
+    let args = Args::parse_from(cli::rewrite_nmap_flags(std::env::args()));
 
     if args.udp {
         eprintln!(
@@ -49,20 +51,68 @@ async fn main() {
         }
     };
 
-    let specs = args.targets();
+    let specs = match args.target_specs() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("truemap: {e}");
+            std::process::exit(2);
+        }
+    };
     if specs.is_empty() {
-        eprintln!("truemap: no targets. Pass them positionally or with -a/--addresses.");
+        eprintln!(
+            "truemap: no targets. Pass them positionally, with -a/--addresses, or with \
+             -iL <file>."
+        );
         std::process::exit(2);
     }
+
+    // Exclusions are resolved to NETWORKS and applied per address below, not by
+    // string-matching the specs. `-iL scope.txt -x 10.0.0.5` has to work when
+    // 10.0.0.5 is reached via a CIDR in the file, which is the whole point of -x.
+    // A malformed -x is fatal: continuing would scan the address it names.
+    let (excluded, bad_excludes) = target::exclusion_nets(&args.exclude_addresses);
+    if !bad_excludes.is_empty() {
+        for b in &bad_excludes {
+            eprintln!("truemap: -x {b}");
+        }
+        eprintln!(
+            "truemap: refusing to scan with an exclusion that could not be resolved -- \
+             it would not have excluded anything."
+        );
+        std::process::exit(2);
+    }
+
     let mut hosts: Vec<(String, IpAddr)> = Vec::new();
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
     for t in &specs {
         match target::resolve_targets(t) {
-            Ok(mut v) => hosts.append(&mut v),
-            Err(e) => eprintln!("truemap: {e}"),
+            Ok(v) => {
+                for (name, ip) in v {
+                    if target::is_excluded(&ip, &excluded) {
+                        skipped += 1;
+                        continue;
+                    }
+                    // Overlapping entries in a list file are normal -- a CIDR and one
+                    // of its hosts, or the same host twice. Scanning an address twice
+                    // wastes the budget and doubles the rate seen by that address.
+                    if !hosts.iter().any(|(n, i)| *i == ip && *n == name) {
+                        hosts.push((name, ip));
+                    }
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                eprintln!("truemap: {e}");
+            }
         }
     }
     if hosts.is_empty() {
-        eprintln!("truemap: no resolvable targets");
+        if skipped > 0 && failed == 0 {
+            eprintln!("truemap: every target was excluded by -x; nothing to scan");
+        } else {
+            eprintln!("truemap: no resolvable targets");
+        }
         std::process::exit(2);
     }
 
@@ -77,6 +127,9 @@ async fn main() {
     }
     let concurrency = sweep::default_concurrency(Some(args.batch_size));
     if !args.terse() {
+        if skipped > 0 {
+            eprintln!("truemap: {skipped} address(es) excluded by -x");
+        }
         eprintln!(
             "truemap: {} host(s), {} port(s), batch {} (fd limit {}), {} control port(s) per host",
             hosts.len(),

@@ -87,9 +87,57 @@ cargo test                                          # 68 unit tests, no network 
 truemap 10.0.0.5                        # top 1000 ports
 truemap -a 10.0.0.0/24 -r 1-1000        # a range across a CIDR
 truemap 10.0.0.5 -p 22,80,443 -g        # greppable: 10.0.0.5 -> [22,80]
+truemap 10.0.0.5 -p-                    # every port, 1-65535
+truemap -iL scope.txt -r 1-1000         # targets from a file, one IP or CIDR per line
+truemap -iL scope.txt -x 10.0.0.5       # ... minus one out-of-scope address
 truemap 10.0.0.5 -r 1-65535 -- -A -sC   # proven ports -> nmap
 truemap 10.0.0.5 --l4 --deep            # every answering port, plus the raw SYN-ACK test
 ```
+
+### Target lists (`-iL`)
+
+A scope is usually a file, not a command line. `-iL <file>` reads one target per line —
+an IP, a CIDR or a hostname — and `-` reads the list from stdin:
+
+```sh
+$ cat scope.txt
+# in scope as of 2026-10-07
+10.0.0.1
+10.0.0.2        # the jump host
+10.0.42.0/24
+# 10.0.0.99 is OUT of scope
+
+$ truemap -iL scope.txt -p-
+$ printf '10.0.0.1\n10.0.42.0/24\n' | truemap -iL - -r 1-1000
+```
+
+`#` starts a comment, blank lines are skipped, spaces, tabs and commas separate entries
+as well as newlines, and repeated or overlapping entries are scanned once — a CIDR plus
+one of its own hosts does not get probed twice.
+
+**A malformed entry fails the whole file, before anything is scanned,** and every bad
+line is reported with its number:
+
+```
+$ truemap -iL scope.txt
+truemap: scope.txt: 3 unusable entries:
+          line 2: "10.0.0.256" — not a valid IPv4 address
+          line 7: "10.0.0.1-20" — octet ranges are not supported; use a CIDR
+          line 9: "10.0.0.0/33" — not a valid CIDR
+```
+
+That is deliberate. A list file is normally a scope document, and scanning the part of it
+that parsed is worse than scanning none of it: the operator is left believing the rest
+was covered. For the same reason a mistyped address says so, rather than being passed to
+DNS and coming back as an unresolvable hostname, and nmap's octet ranges — which truemap
+does not implement — name themselves instead of failing obscurely.
+
+> **`-x` excludes by address, not by matching the text you typed.** So
+> `truemap -iL scope.txt -x 10.0.0.5` drops 10.0.0.5 even when the file only reaches it
+> via `10.0.0.0/24`, and `-x 10.0.1.0/24` drops that whole range. RustScan compares spec
+> strings, which means its `-a 10.0.0.0/24 -x 10.0.0.5` scans 10.0.0.5 anyway. An
+> exclusion that cannot be resolved is fatal rather than ignored — one that silently
+> matches nothing is the dangerous direction.
 
 ```
 $ truemap 10.0.0.5 -p 22,80,443,3306
@@ -119,9 +167,10 @@ truemap [OPTIONS] [IPS_OR_HOSTS]... [-- <COMMAND>...]
 | option | description | default |
 |--------|-------------|---------|
 | `-a`, `--addresses <LIST>` | IPs, CIDRs or hostnames (also positional) | |
-| `-x`, `--exclude-addresses <LIST>` | addresses to skip | |
-| `-p`, `--ports <LIST>` | comma-separated ports: `80,443,8080` | |
-| `-r`, `--range <START-END>` | a port range: `1-65535`; also `all`, `top1000`, `anchors` | |
+| `-x`, `--exclude-addresses <LIST>` | addresses to skip, matched **by address** | |
+| `-p`, `--ports <LIST>` | comma-separated ports: `80,443,8080`; a range also works | |
+| `-p-` | every port, 1-65535 (nmap's spelling; `-p1-` and `-p-1024` too) | |
+| `-r`, `--range <START-END>` | a port range: `1-65535`; also `all`, `top1000`, `anchors`, `-` | |
 | `--top` | the 1000 most common ports | *(default)* |
 | `-e`, `--exclude-ports <LIST>` | ports to skip | |
 | `-b`, `--batch-size <N>` | concurrency, capped at the fd limit | `4500` |
@@ -139,6 +188,7 @@ truemap [OPTIONS] [IPS_OR_HOSTS]... [-- <COMMAND>...]
 
 | option | description | default |
 |--------|-------------|---------|
+| `-iL`, `--input-list <FILE>` | read targets from a file, one per line; `-` is stdin | |
 | `--controls <N>` | known-closed control ports per host | `12` |
 | `--deep` | prove every answering port, not just likely-service ports | |
 | `--l4` | also run the SYN-ACK window/options test (needs `CAP_NET_RAW`) | |
