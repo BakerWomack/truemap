@@ -12,6 +12,7 @@ mod cli;
 mod coherent;
 mod liveness;
 mod nmap;
+mod nmapout;
 mod output;
 mod ports;
 mod probe;
@@ -31,7 +32,14 @@ use crate::probe::ProbeCfg;
 async fn main() {
     // nmap's `-iL` and `-p-` are rewritten into flags clap can express before it
     // ever sees them; see cli::rewrite_nmap_flags for why they cannot be declared.
-    let args = Args::parse_from(cli::rewrite_nmap_flags(std::env::args()));
+    let rewritten = cli::rewrite_nmap_flags(std::env::args());
+    if !rewritten.errors.is_empty() {
+        for e in &rewritten.errors {
+            eprintln!("truemap: {e}");
+        }
+        std::process::exit(2);
+    }
+    let args = Args::parse_from(rewritten.argv);
 
     if args.udp {
         eprintln!(
@@ -40,6 +48,17 @@ async fn main() {
              layer, and UDP has no handshake to calibrate against. Use `nmap -sU` for UDP. \
              Failing here rather than silently scanning TCP and labelling it UDP."
         );
+        std::process::exit(2);
+    }
+
+    // Flags truemap accepts only so they fail loudly. Refusing here, before any
+    // packet, is the point: an ignored -e/-g would mean the scan went out from
+    // somewhere other than where the operator believes it did.
+    let refusals = args.refusals();
+    if !refusals.is_empty() {
+        for r in &refusals {
+            eprintln!("truemap: {r}");
+        }
         std::process::exit(2);
     }
 
@@ -70,7 +89,17 @@ async fn main() {
     // string-matching the specs. `-iL scope.txt -x 10.0.0.5` has to work when
     // 10.0.0.5 is reached via a CIDR in the file, which is the whole point of -x.
     // A malformed -x is fatal: continuing would scan the address it names.
-    let (excluded, bad_excludes) = target::exclusion_nets(&args.exclude_addresses);
+    let mut exclude_specs = args.exclude_addresses.clone();
+    if let Some(f) = &args.exclude_file {
+        match target::read_target_list(f) {
+            Ok(v) => exclude_specs.extend(v),
+            Err(e) => {
+                eprintln!("truemap: --excludefile {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+    let (excluded, bad_excludes) = target::exclusion_nets(&exclude_specs);
     if !bad_excludes.is_empty() {
         for b in &bad_excludes {
             eprintln!("truemap: -x {b}");
@@ -80,6 +109,28 @@ async fn main() {
              it would not have excluded anything."
         );
         std::process::exit(2);
+    }
+
+    // -n means never resolve. A hostname target cannot be honoured without DNS, so
+    // it is an error rather than a silent skip.
+    if args.no_dns {
+        let names: Vec<&String> = specs
+            .iter()
+            .filter(|s| s.parse::<std::net::IpAddr>().is_err() && s.parse::<ipnet::IpNet>().is_err())
+            .collect();
+        if !names.is_empty() {
+            eprintln!(
+                "truemap: -n/--no-dns forbids resolution, but {} target(s) are hostnames: {}",
+                names.len(),
+                names
+                    .iter()
+                    .take(5)
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            std::process::exit(2);
+        }
     }
 
     let mut hosts: Vec<(String, IpAddr)> = Vec::new();
@@ -152,6 +203,25 @@ async fn main() {
         }
     }
 
+    let view = output::View {
+        color,
+        show_fakes: args.show_fakes,
+        open_only: args.open,
+        reason: args.reason,
+        verbose: args.verbose,
+    };
+    if args.debug >= 1 {
+        eprintln!(
+            "truemap: [debug] {} spec(s) -> {} host(s); order {:?}; timeout {}ms; tries {}",
+            specs.len(),
+            hosts.len(),
+            args.order(),
+            args.timeout,
+            args.tries
+        );
+    }
+
+    let run_started = nmapout::now_secs();
     let mut all: Vec<output::HostOutput> = Vec::new();
 
     for (name, ip) in hosts {
@@ -187,7 +257,7 @@ async fn main() {
             concurrency,
             timeout: Duration::from_millis(args.timeout),
             tries: args.tries,
-            order: args.scan_order,
+            order: args.order(),
             announce: !args.terse(),
             bail_after: args.bail_after,
         };
@@ -244,9 +314,17 @@ async fn main() {
 
         if args.greppable || args.quiet {
             print!("{}", output::greppable_rustscan(&ho));
-        } else if !args.json {
-            print!("{}", output::human(&ho, color, args.show_fakes));
+        } else if !args.json && !args.stdout_is_a_report() {
+            print!("{}", output::human(&ho, &view));
             eprintln!("  (host finished in {:.1}s)", started.elapsed().as_secs_f64());
+        }
+        if args.debug >= 1 {
+            eprintln!(
+                "truemap: [debug] {} adjudicated {} candidate(s) in {:.2}s",
+                ho.ip,
+                ho.ports.len(),
+                started.elapsed().as_secs_f64()
+            );
         }
 
         // ---- The nmap hand-off: the PROVEN ports only. ----
@@ -274,6 +352,11 @@ async fn main() {
         all.push(ho);
     }
 
+    if let Err(e) = write_reports(&args, &all, run_started) {
+        eprintln!("truemap: {e}");
+        std::process::exit(1);
+    }
+
     if args.json {
         match serde_json::to_string_pretty(&all) {
             Ok(s) => println!("{s}"),
@@ -288,6 +371,65 @@ async fn main() {
     if !all.iter().any(|h| h.verdict.real_count > 0) {
         std::process::exit(1);
     }
+}
+
+/// Write whichever of `-oN`/`-oG`/`-oX`/`-oA` were asked for.
+///
+/// `-` means stdout, as in nmap. Failing to write a requested report is fatal: the
+/// operator asked for a record of the scan, and silently not producing one leaves
+/// them believing it exists.
+fn write_reports(
+    args: &Args,
+    all: &[output::HostOutput],
+    started: u64,
+) -> Result<(), String> {
+    let finished = nmapout::now_secs();
+    // nmap does not enumerate closed ports unless asked; -v asks. `--open` and the
+    // default coincide here, which is faithful to nmap.
+    let list_closed = args.verbose >= 1;
+
+    let mut jobs: Vec<(String, String)> = Vec::new();
+    if let Some(f) = &args.output_normal {
+        jobs.push((f.clone(), nmapout::normal(all, started, finished, list_closed)));
+    }
+    if let Some(f) = &args.output_grep {
+        jobs.push((f.clone(), nmapout::grepable(all, started, finished, list_closed)));
+    }
+    if let Some(f) = &args.output_xml {
+        jobs.push((f.clone(), nmapout::xml(all, started, finished, list_closed)));
+    }
+    if let Some(base) = &args.output_all {
+        if base == "-" {
+            return Err(
+                "-oA writes three files and so needs a basename, not `-`. Use -oN/-oG/-oX                  individually to send one of them to stdout."
+                    .into(),
+            );
+        }
+        jobs.push((
+            format!("{base}.{}", nmapout::EXT_NORMAL),
+            nmapout::normal(all, started, finished, list_closed),
+        ));
+        jobs.push((
+            format!("{base}.{}", nmapout::EXT_GREP),
+            nmapout::grepable(all, started, finished, list_closed),
+        ));
+        jobs.push((
+            format!("{base}.{}", nmapout::EXT_XML),
+            nmapout::xml(all, started, finished, list_closed),
+        ));
+    }
+
+    for (path, body) in jobs {
+        if path == "-" {
+            print!("{body}");
+        } else {
+            std::fs::write(&path, body).map_err(|e| format!("cannot write {path}: {e}"))?;
+            if !args.terse() {
+                eprintln!("truemap: wrote {path}");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Run the raw SYN fingerprint on a bounded sample plus the anchors.

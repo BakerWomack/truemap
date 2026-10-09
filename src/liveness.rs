@@ -43,6 +43,17 @@ impl Liveness {
             Liveness::NoResponse => "NO RESPONSE (all probes dropped)",
         }
     }
+
+    /// Is the host demonstrably reachable? Used for the `Status: Up` / `state="up"`
+    /// field in the nmap-shaped outputs.
+    ///
+    /// `AliveOpaque` counts as up: nothing could be PROVED to run there, but the
+    /// handshakes completed, so something at that address is answering. Only
+    /// `NoResponse` is false, and it means undetermined rather than down -- every
+    /// probe was dropped, which a dead host and a silent firewall produce alike.
+    pub fn is_up(self) -> bool {
+        !matches!(self, Liveness::NoResponse)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

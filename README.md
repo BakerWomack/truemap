@@ -85,12 +85,13 @@ cargo test                                          # 68 unit tests, no network 
 
 ```sh
 truemap 10.0.0.5                        # top 1000 ports
-truemap -a 10.0.0.0/24 -r 1-1000        # a range across a CIDR
-truemap 10.0.0.5 -p 22,80,443 -g        # greppable: 10.0.0.5 -> [22,80]
+truemap -a 10.0.0.0/24 -p 1-1000        # a range across a CIDR
+truemap 10.0.0.5 -p 22,80,443 -q        # greppable: 10.0.0.5 -> [22,80]
 truemap 10.0.0.5 -p-                    # every port, 1-65535
-truemap -iL scope.txt -r 1-1000         # targets from a file, one IP or CIDR per line
+truemap -iL scope.txt -p 1-1000         # targets from a file, one IP or CIDR per line
 truemap -iL scope.txt -x 10.0.0.5       # ... minus one out-of-scope address
-truemap 10.0.0.5 -r 1-65535 -- -A -sC   # proven ports -> nmap
+truemap 10.0.0.5 -p- -oA scan            # every port; nmap-format output files
+truemap 10.0.0.5 -p 1-65535 -- -A -sC   # proven ports -> nmap
 truemap 10.0.0.5 --l4 --deep            # every answering port, plus the raw SYN-ACK test
 ```
 
@@ -108,7 +109,7 @@ $ cat scope.txt
 # 10.0.0.99 is OUT of scope
 
 $ truemap -iL scope.txt -p-
-$ printf '10.0.0.1\n10.0.42.0/24\n' | truemap -iL - -r 1-1000
+$ printf '10.0.0.1\n10.0.42.0/24\n' | truemap -iL - -p 1-1000
 ```
 
 `#` starts a comment, blank lines are skipped, spaces, tabs and commas separate entries
@@ -131,6 +132,41 @@ that parsed is worse than scanning none of it: the operator is left believing th
 was covered. For the same reason a mistyped address says so, rather than being passed to
 DNS and coming back as an unresolvable hostname, and nmap's octet ranges — which truemap
 does not implement — name themselves instead of failing obscurely.
+
+### nmap-format output (`-oN` / `-oG` / `-oX` / `-oA`)
+
+For dropping into a pipeline that already parses nmap. Verified: the XML is parsed
+by the `libnmap` library, yielding the same hosts, states, ports and service names
+it extracts from real nmap XML.
+
+```
+$ truemap 10.0.0.5 10.0.0.9 -p 1-200 -oA scan
+truemap: wrote scan.nmap
+truemap: wrote scan.gnmap
+truemap: wrote scan.xml
+
+$ cat scan.gnmap
+Host: 10.0.0.9 ()	Status: Up
+Host: 10.0.0.9 ()	Ports: 22/open/tcp//ssh///	Ignored State: closed (52)
+```
+
+Closed ports are counted, not enumerated, as nmap does it — `Not shown:`,
+`Ignored State:` and `<extraports>`. `-v` lists them with their verdicts.
+
+> **One deliberate divergence, and it is the whole point of the tool.** A port that
+> answered the handshake but could not be shown to run a service is reported
+> **`closed`**, where nmap reports it **`open`** (often as `tcpwrapped`). On a
+> SYN-proxied host that is the difference between two open ports and 65535.
+> Encoding them as open would make `--open`, `grep open` and every downstream
+> consumer useless on exactly the hosts truemap exists for. Nothing is hidden: the
+> truemap verdict travels in the `reason` field, so the fact that the port
+> *answered* is still on record.
+>
+> The XML says `scanner="truemap"`, not `nmap`, and the service names are truemap's
+> protocol classes rather than entries from nmap's service database. It is
+> nmap-*shaped*, and claiming otherwise in a file someone else's tooling reads would
+> be a lie about provenance. truemap's own evidence rides along in
+> `<truemap-evidence>` and `<truemap-calibration>`, which an nmap parser ignores.
 
 > **`-x` excludes by address, not by matching the text you typed.** So
 > `truemap -iL scope.txt -x 10.0.0.5` drops 10.0.0.5 even when the file only reaches it
@@ -156,30 +192,96 @@ $ truemap 10.0.0.5 -p 22,80,443,3306
 Exit status is `1` when no host could be shown to run a service, which is useful in
 pipelines.
 
+### nmap's flags
+
+The single-letter flags follow **nmap**. A pasted nmap command mostly just works:
+
+```sh
+truemap -iL scope.txt -p- --open -oA scan      # all nmap spellings
+truemap 10.0.0.5 -F -oG - --reason -vv         # fast scan, grepable to stdout
+```
+
+> ### ⚠ Breaking change: four letters changed meaning
+>
+> truemap used to take rustscan's single-letter flags. Where nmap and rustscan
+> disagree, **nmap now wins**, and rustscan's meaning keeps its long form:
+>
+> | letter | now means (nmap) | rustscan's meaning, now long-only |
+> |--------|------------------|-----------------------------------|
+> | `-r`   | scan ports sequentially (takes **no** value) | `--range <SPEC>` |
+> | `-e`   | interface | `--exclude-ports <LIST>` |
+> | `-b`   | FTP bounce host | `--batch-size <N>` |
+> | `-g`   | source port | `--greppable` (also `-q`) |
+>
+> `-a`, `-x`, `-p`, `-t`, `-u` and `-q` are unchanged — nmap does not use those
+> letters. An old command that uses a reassigned flag **fails with the flag you
+> meant**, rather than doing something different:
+>
+> ```
+> $ truemap 10.0.0.5 -r 1-1000
+> truemap: -r takes no value: in nmap's CLI it means "scan ports sequentially".
+>          You passed "1-1000", which is a port spec, so it would have been read
+>          as a TARGET and resolved as a hostname. Use `-p 1-1000` or
+>          `--range 1-1000`; `-r` alone still forces sequential order.
+> ```
+>
+> That check is not decoration. `-r` takes no value now, so clap would have
+> accepted `1-1000` as a **positional target** and truemap would have tried to
+> resolve a port range as a hostname. The error exists because the silent
+> misreading was the realistic outcome.
+
+**Accepted and refused, with the reason.** `-e`, `-b` and `-g` all need the socket
+configured before `connect()`, which this scanner never owns, so they exit rather
+than being ignored — a scan that quietly went out of the wrong interface is worse
+than one that refuses. `-sU` / `--udp` and `-O` are likewise refused; truemap is a
+TCP connect scanner. `-Pn` and `-R` are accepted no-ops: truemap never pings and
+never does reverse DNS, so they already describe its behaviour.
+
+**`-iR` is deliberately not implemented.** Its job is to generate targets nobody
+authorised, and this tool gets pointed at scoped engagements.
+
+**Not implemented (yet):** `-T0..5`, `--max-retries`, `--host-timeout`. Use
+`-t/--timeout`, `--tries` and `--batch-size`.
+
 ### Options
 
 ```
 truemap [OPTIONS] [IPS_OR_HOSTS]... [-- <COMMAND>...]
 ```
 
-**RustScan-compatible**
+**Targets, ports and scanning**
 
 | option | description | default |
 |--------|-------------|---------|
 | `-a`, `--addresses <LIST>` | IPs, CIDRs or hostnames (also positional) | |
-| `-x`, `--exclude-addresses <LIST>` | addresses to skip, matched **by address** | |
+| `-x`, `--exclude-addresses <LIST>` | addresses to skip, matched **by address** (nmap: `--exclude`) | |
 | `-p`, `--ports <LIST>` | comma-separated ports: `80,443,8080`; a range also works | |
 | `-p-` | every port, 1-65535 (nmap's spelling; `-p1-` and `-p-1024` too) | |
-| `-r`, `--range <START-END>` | a port range: `1-65535`; also `all`, `top1000`, `anchors`, `-` | |
+| `--range <SPEC>` | a port range: `1-65535`; also `all`, `top1000`, `anchors`, `-` | |
+| `-F`, `--fast` | the 100 most common ports | |
+| `--top-ports <N>` | the N most common ports (N ≤ 1000) | |
+| `-r`, `--sequential` | scan ports in order, do not randomise | |
 | `--top` | the 1000 most common ports | *(default)* |
-| `-e`, `--exclude-ports <LIST>` | ports to skip | |
-| `-b`, `--batch-size <N>` | concurrency, capped at the fd limit | `4500` |
+| `--exclude-ports <LIST>` | ports to skip | |
+| `--excludefile <FILE>` | exclusions from a file, one per line | |
+| `--batch-size <N>` | concurrency, capped at the fd limit | `4500` |
 | `-t`, `--timeout <MS>` | before a port is assumed closed | `1500` |
 | `--tries <N>` | attempts per port | `2` |
 | `-u`, `--ulimit <N>` | raise `RLIMIT_NOFILE` before scanning | |
 | `--scan-order <ORDER>` | `serial` or `random` | `serial` |
 | `--scripts <WHICH>` | `default` or `none` | `default` |
-| `-g`, `--greppable` | only `ip -> [ports]` (aliases `--grep`, `-q`, `--quiet`) | |
+| `--greppable` | only `ip -> [ports]` (aliases `--grep`, `-q`, `--quiet`) | |
+| `-oN <FILE>` | nmap's normal layout to a file; `-` is stdout | |
+| `-oG <FILE>` | nmap's grepable layout; `-` is stdout | |
+| `-oX <FILE>` | nmap-shaped XML; `-` is stdout | |
+| `-oA <BASE>` | all three, as `BASE.nmap` / `.gnmap` / `.xml` | |
+| `--open` | show only ports proved to run a service | |
+| `--reason` | show why each port got its verdict | |
+| `-v`, `-vv` | list the suppressed ports; `-vv` adds the control ports | |
+| `-d` | debug output on stderr | |
+| `-n`, `--no-dns` | never resolve; a hostname target becomes an error | |
+| `-R`, `-Pn` | accepted no-ops (truemap never reverse-resolves, never pings) | |
+| `-e <IFACE>`, `-b <HOST>`, `-g <PORT>` | accepted and **refused** with the reason | |
 | `--accessible` | no ASCII art, no large text blocks | |
 | `--udp` | accepted and refused with an explanation; truemap is TCP-only | |
 | `-- <COMMAND>...` | nmap args; truemap appends `-Pn -p <proven ports>` | |
@@ -425,6 +527,12 @@ will never speak. That is the price of not misreporting the result.
 ---
 
 ## Differences from RustScan
+
+**The command line is nmap's, not rustscan's** — see the table above. `-r`, `-e`,
+`-b` and `-g` were rustscan's and are now nmap's; their rustscan meanings live on as
+`--range`, `--exclude-ports`, `--batch-size` and `--greppable`. Everything else
+below is about behaviour rather than spelling.
+
 
 An existing RustScan command works unchanged. Four behaviours differ, and each is loud
 rather than silent:

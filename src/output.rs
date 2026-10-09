@@ -60,7 +60,27 @@ pub fn greppable_rustscan(h: &HostOutput) -> String {
     format!("{} -> [{}]\n", h.ip, ports.join(","))
 }
 
-pub fn human(h: &HostOutput, color: bool, show_fakes: bool) -> String {
+/// How much of the report to render. Gathered into a struct because the flags that
+/// steer it (`--open`, `--reason`, `-v`, `--show-fakes`) only ever travel together.
+#[derive(Clone, Copy, Default)]
+pub struct View {
+    pub color: bool,
+    pub show_fakes: bool,
+    pub open_only: bool,
+    pub reason: bool,
+    pub verbose: u8,
+}
+
+impl View {
+    /// `-v` implies listing the suppressed ports, as nmap's does.
+    pub fn fakes_listed(&self) -> bool {
+        self.show_fakes || self.verbose >= 1
+    }
+}
+
+pub fn human(h: &HostOutput, view: &View) -> String {
+    let color = view.color;
+    let show_fakes = view.fakes_listed();
     let c = |s: &'static str| -> &'static str { if color { s } else { "" } };
     let mut o = String::new();
 
@@ -97,6 +117,15 @@ pub fn human(h: &HostOutput, color: bool, show_fakes: bool) -> String {
             "  {}            \"port open\" carries no information on this host — every verdict \
              below comes from the application layer.{}\n",
             c(DIM), c(OFF)
+        ));
+    }
+
+    if view.verbose >= 2 {
+        o.push_str(&format!(
+            "  {}             control ports: {}{}\n",
+            c(DIM),
+            brief_ports(&h.calibration.control_ports),
+            c(OFF)
         ));
     }
 
@@ -140,6 +169,12 @@ pub fn human(h: &HostOutput, color: bool, show_fakes: bool) -> String {
                 r.port, c(vc), r.verdict.label(), c(OFF),
                 truncate(&r.sample, 48)
             ));
+            if view.reason {
+                o.push_str(&format!(
+                    "  {}        why: {}{}\n",
+                    c(DIM), wrap(&r.why, 84, 13), c(OFF)
+                ));
+            }
         }
     } else {
         o.push_str(&format!(
@@ -147,7 +182,14 @@ pub fn human(h: &HostOutput, color: bool, show_fakes: bool) -> String {
         ));
     }
 
-    if !fake.is_empty() {
+    if !fake.is_empty() && view.open_only {
+        // --open: say how many were dropped, but not one line each. Staying silent
+        // would hide that the host answered on 4312 ports, which is the finding.
+        o.push_str(&format!(
+            "\n  {}{} answering port(s) hidden by --open (none could be proved){}\n",
+            c(DIM), fake.len(), c(OFF)
+        ));
+    } else if !fake.is_empty() {
         // Collapsed by default. This is the whole point: a reader should see "4312
         // fabricated" rather than 4312 lines.
         let mut by_reason: std::collections::BTreeMap<String, Vec<u16>> = Default::default();
@@ -166,7 +208,19 @@ pub fn human(h: &HostOutput, color: bool, show_fakes: bool) -> String {
                 c(OFF)
             ));
         }
-        if let Some(f) = fake.first() {
+        if view.reason || view.verbose >= 1 {
+            // One `why` per distinct verdict, rather than the first port's only.
+            let mut seen: std::collections::BTreeSet<String> = Default::default();
+            for f in &fake {
+                let label = f.verdict.label();
+                if seen.insert(label.clone()) {
+                    o.push_str(&format!(
+                        "  {}  {}: {}{}\n",
+                        c(DIM), label, wrap(&f.why, 84, 12), c(OFF)
+                    ));
+                }
+            }
+        } else if let Some(f) = fake.first() {
             o.push_str(&format!("  {}  why: {}{}\n", c(DIM), wrap(&f.why, 88, 12), c(OFF)));
         }
     }
@@ -247,7 +301,7 @@ mod tests {
         for p in 1000..5000u16 {
             ports.push(rep(p, Verdict::PhantomControlMatch));
         }
-        let text = human(&out(ports, Posture::Blanket), false, false);
+        let text = human(&out(ports, Posture::Blanket), &View::default());
         let lines = text.lines().count();
         assert!(lines < 30, "report must stay readable, got {lines} lines");
         assert!(text.contains("4000 fabricated"), "must state the count: {text}");
@@ -278,9 +332,54 @@ mod tests {
     }
 
     #[test]
+    fn open_only_reports_the_count_but_not_the_breakdown() {
+        // --open must still say the host answered on those ports. Dropping the fact
+        // entirely would hide the finding that matters on a SYN-proxied host.
+        let mut ports = vec![rep(22, Verdict::Real(Proto::Ssh))];
+        for p in 1000..1050u16 {
+            ports.push(rep(p, Verdict::PhantomControlMatch));
+        }
+        let v = View { open_only: true, ..Default::default() };
+        let text = human(&out(ports, Posture::Blanket), &v);
+        assert!(text.contains("real:ssh"));
+        assert!(text.contains("50 answering port(s) hidden"), "{text}");
+        assert!(!text.contains("phantom(matches-closed-control)"), "{text}");
+    }
+
+    #[test]
+    fn reason_gives_one_why_per_verdict_not_just_the_first_ports() {
+        let ports = vec![
+            rep(1000, Verdict::PhantomControlMatch),
+            rep(1001, Verdict::Tarpit),
+        ];
+        let v = View { reason: true, ..Default::default() };
+        let text = human(&out(ports, Posture::Blanket), &v);
+        assert!(text.contains("phantom(matches-closed-control):"), "{text}");
+        assert!(text.contains("tarpit(accepted-then-froze):"), "{text}");
+    }
+
+    #[test]
+    fn dash_v_lists_the_suppressed_ports_without_show_fakes() {
+        let ports = vec![
+            rep(22, Verdict::Real(Proto::Ssh)),
+            rep(1234, Verdict::FakeUniform),
+        ];
+        let v = View { verbose: 1, ..Default::default() };
+        let text = human(&out(ports, Posture::Blanket), &v);
+        assert!(text.contains("1234"), "-v must name them: {text}");
+    }
+
+    #[test]
+    fn dash_v_v_shows_the_control_ports_that_calibration_used() {
+        let v = View { verbose: 2, ..Default::default() };
+        let text = human(&out(vec![rep(22, Verdict::Real(Proto::Ssh))], Posture::Blanket), &v);
+        assert!(text.contains("control ports: 50001"), "{text}");
+    }
+
+    #[test]
     fn a_clean_host_report_does_not_mention_suppression() {
         let text = human(&out(vec![rep(22, Verdict::Real(Proto::Ssh))], Posture::Discriminating),
-                         false, false);
+                         &View::default());
         assert!(!text.contains("fabricated"));
         assert!(text.contains("discriminating"));
     }
